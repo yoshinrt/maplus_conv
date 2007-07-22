@@ -1,3 +1,5 @@
+// $Id$
+
 KML_KEYWORD( KML_NAME,		"<name>" )
 KML_KEYWORD( KML_FOLDER,	"<Folder>" )
 KML_KEYWORD( KML_FOLDER2,	"</Folder>" )

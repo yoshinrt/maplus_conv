@@ -1,4 +1,7 @@
 @echo off
+
+: $Id$
+
 call "C:\Program Files\Microsoft Visual Studio\VC98\Bin\VCVARS32.BAT"
 cl /O2 /MD /nologo %1 /link /NOLOGO
 
