@@ -1,13 +1,13 @@
 /****************************************************************************/
 
-// $Id$
-
 //#define DEBUG
 
 #include <stdio.h>
 #include <string.h>
 #include <windows.h>
 #include <winnls.h>
+#include <math.h>
+#include <imagehlp.h>
 //#include <ctype.h>
 
 #include "dds.h"
@@ -18,6 +18,12 @@
 
 #define MAX_FOLDER_NUM	50
 #define MAX_SPOT_NUM	50
+
+#define MAX_ROUTE		200
+#define MAX_ROUTE_WP	5
+
+#define ROUTE_ID		"Routes"
+#define L_ROUTE_ID		L"Routes"
 
 /*** macro ******************************************************************/
 
@@ -60,10 +66,13 @@ enum {
 enum {
 	MODE_TXT,
 	MODE_CSV,
-	MODE_KML
+	MODE_KML,
+	MODE_ROUTE	= ( 1 << 8 ),
 };
 
 /*** new type ***************************************************************/
+
+// MAPLUS favorite.dat
 
 typedef struct {
 	UINT	uIcon;
@@ -84,6 +93,21 @@ typedef struct {
 	MAPLUS_FOLDER	Folder[ MAX_FOLDER_NUM ];
 } MAPLUS_DATA;
 
+// MAPLUS route data
+
+typedef struct {
+	WCHAR	szName[ 200 / 2 ];
+	UINT	uLati;
+	UINT	uLong;
+} ROUTE_WP;
+
+typedef struct {
+	UCHAR		cHeader[ 20 ];
+	WCHAR		szName[ 200 / 2 ];
+	ROUTE_WP	WayPoint[ MAX_ROUTE_WP ];
+} ROUTE_DATA;
+
+// misc
 typedef struct {
 	UINT	uID;
 	UCHAR	*szPath;
@@ -91,7 +115,9 @@ typedef struct {
 
 /*** gloval var *************************************************************/
 
-MAPLUS_DATA		*g_pData;
+MAPLUS_DATA		*g_pFavoData;
+ROUTE_DATA		*g_pRouteData;
+UINT			g_uRouteCnt;
 
 UCHAR	g_szBuf			[ BUF_SIZE ];
 UCHAR	g_szBuf2		[ BUF_SIZE ];
@@ -451,12 +477,12 @@ UCHAR *StrTokFile( UCHAR *szDst, UCHAR *szFileName, UCHAR cMode ){
 
 BOOL IsExt( UCHAR *szFileName, UCHAR *szExt ){
 	
-	UCHAR *pExt;
+	UCHAR *pExt = SearchExt( szFileName );
 	
 	return(
-		( pExt = SearchExt( szFileName )) == NULL ?
-			szExt == NULL :
-			!stricmp( ++pExt, szExt )
+		pExt  == NULL ? szExt == NULL :
+		szExt == NULL ? FALSE :
+						!stricmp( ++pExt, szExt )
 	);
 }
 
@@ -464,10 +490,18 @@ BOOL IsExt( UCHAR *szFileName, UCHAR *szExt ){
 
 UCHAR *ChangeExt( UCHAR *szDst, UCHAR *szFileName, UCHAR *szExt ){
 	
-	StrTokFile( szDst, szFileName, STF_PATH2 | STF_NODE );
+	UINT u;
+	
+	if(( u = strlen( szFileName )) && ( szFileName[ u - 1 ] == '\\' )){
+		strcpy( szDst, szFileName );
+		szDst[ u - 1 ] = '\0';
+	}else{
+		StrTokFile( szDst, szFileName, STF_PATH2 | STF_NODE );
+	}
+	
 	return(
-		( szExt )	? strcat( strcat( szDst, "." ), szExt )
-					: szDst
+		szExt	? strcat( strcat( szDst, "." ), szExt )
+				: szDst
 	);
 }
 
@@ -494,46 +528,27 @@ WCHAR *ConvHan2Zen( WCHAR *szDst, WCHAR *szSrc ){
 	return( szDst );
 }
 
-/*** tab ⇔ csv 変換 ********************************************************/
+/*** 漢字コード変換 *********************************************************/
 
-UCHAR *ConvTab2Csv( UCHAR *szStr ){
-	UCHAR *s = szStr;
-	for(; *s; ++s ) if( *s == '\t' ) *s = ',';
-	return( szStr );
-}
+#define ConvMulti2Uni( cp, src, dst ) MultiByteToWideChar( \
+	cp,					/* UINT		CodePage,		コードページ */ \
+	0,					/* DWORD	dwFlags,		文字の種類を指定するフラグ */ \
+	src,				/* LPCSTR	lpMultiByteStr,	マップ元文字列のアドレス */ \
+	strlen( src ),		/* int		cchMultiByte,	マップ元文字列のバイト数 */ \
+	( WCHAR *)( dst ),	/* LPWSTR	lpWideCharStr,	マップ先ワイド文字列を入れるバッファのアドレス */ \
+	sizeof( dst )		/* int		cchWideChar		バッファのサイズ */ \
+)
 
-UCHAR *ConvCsv2Tab( UCHAR *szStr ){
-	UCHAR	*s = szStr;
-	UCHAR	*d = szStr;
-	BOOL	bQuote = FALSE;
-	
-	DebugMsg( ">>%s", szStr );
-	
-	do {
-		if( *s == ',' && !bQuote ){
-			// "～" 内でなければ \t に変換
-			*d++ = '\t';
-		}else if( *s == '"' ){
-			if( s[ 1 ] == '"' ){
-				// "" → " 変換
-				*d++ = '"';
-				++s;
-			}else if(
-				bQuote && ( s[ 1 ] == ',' || s[ 1 ] == '\0' ) ||
-				!bQuote && ( s == szStr || s[ -1 ] == ',' )
-			){
-				bQuote = !bQuote;
-			}else{
-				*d++ = *s;
-			}
-		}else{
-			*d++ = *s;
-		}
-	}while( *s++ );
-	
-	DebugMsg( "<<%s", szStr );
-	return( szStr );
-}
+#define ConvUni2Multi( cp, src, dst ) WideCharToMultiByte( \
+	cp,					/* UINT		uCodePage,		コードページ */ \
+	0,					/* DWORD	dwFlags,		フラグ */ \
+	( LPCWSTR )( src ),	/* PCWSTR	pWideCharStr,	変換元の文字列アドレス */ \
+	sizeof( src ) / sizeof( WCHAR ),/* int	cchWideChar,	文字列の長さ */ \
+	dst,				/* PSTR		pMultiByteStr,	バッファアドレス */ \
+	sizeof( dst ),		/* int		cchMultiByte,	文字列の長さ */ \
+	NULL,				/* PCSTR	pDefaultChar,	デフォルトキャラクタ */ \
+	NULL				/* PBOOL	pUsedDefaultCharフラグを格納するアドレス */ \
+)
 
 /*** config file ************************************************************/
 
@@ -595,6 +610,188 @@ UCHAR *GetCfgAllData( UCHAR *szBuf, UINT uSize, UCHAR *szKeywd ){
 	return( szBuf );
 }
 
+/*** MAPLUS data ロード・セーブ *********************************************/
+
+int InitMaplusData( void ){
+	
+	UINT	u;
+	
+	if(
+		( g_pFavoData  = malloc( sizeof( MAPLUS_DATA ))) == NULL ||
+		( g_pRouteData = malloc( sizeof( ROUTE_DATA ) * MAX_ROUTE )) == NULL
+	){
+		puts( "not enough memony" );
+		return 1;
+	}
+	
+	/*** DAT 初期化 ***/
+	bzero( g_pFavoData, sizeof( MAPLUS_DATA ));
+	strcpy( g_pFavoData->cHeader, "0100" );
+	
+	bzero( g_pRouteData, sizeof( ROUTE_DATA ) * MAX_ROUTE );
+	for( u = 0; u < MAX_ROUTE; ++u ) strcpy( g_pRouteData[ u ].cHeader, "2100" );
+	
+	return 0;
+}
+
+int LoadMaplusData( UCHAR *szFile ){
+	
+	FILE	*fp;
+	UINT	u;
+	UCHAR	*pPath = NULL;
+	
+	if( InitMaplusData()) return 1;
+	
+	// szFile が favorite.dat と仮定してロード
+	DebugMsg( "loading %s...\n", szFile );
+	
+	if(( fp = fopen( szFile, "rb" )) == NULL ){
+		
+		// 失敗したら，szFile\ULJS00128FAVORITE\FAVORITE.DAT をロード
+		strcpy( g_szBuf, szFile );
+		
+		// 終端を \ にする
+		if(( u = strlen( g_szBuf )) && ( g_szBuf[ u - 1 ] != '\\' )){
+			strcat( g_szBuf, "\\" );
+		}
+		
+		pPath = strchr( g_szBuf, '\0' );
+		GetCfgData( pPath, BUF_SIZE, "[maplus_favorite]" );
+		
+		DebugMsg( "faied. now loading %s...\n", g_szBuf );
+		
+		if(( fp = fopen( g_szBuf, "rb" )) == NULL ){
+			printf( "can't open file \"%s\"\n", szFile );
+			return 1;
+		}
+	}
+	
+	fread( g_pFavoData, sizeof( MAPLUS_DATA ), 1, fp );
+	fclose( fp );
+	
+	if( strcmp( g_pFavoData->cHeader, "0100" ) != 0 ){
+		puts( "not MAPLUS FAVORITE.DAT" );
+		return 1;
+	}
+	
+	if( pPath ){
+		// route をロード
+		
+		GetCfgData( pPath, BUF_SIZE, "[maplus_route]" );
+		
+		for( u = 0; u < MAX_ROUTE; ++u ){
+			sprintf( g_szBuf2, g_szBuf, u );
+			
+			if(( fp = fopen( g_szBuf2, "rb" )) != NULL ){
+				DebugMsg( "loading %s\n", g_szBuf2 );
+				fread( &g_pRouteData[ g_uRouteCnt ], sizeof( ROUTE_DATA ), 1, fp );
+				++g_uRouteCnt;
+				fclose( fp );
+			}
+		}
+	}
+	return 0;
+}
+
+int SaveMaplusData( UCHAR *szFile, UINT uOption ){
+	
+	FILE	*fp;
+	UCHAR	*pPath;
+	UINT	u;
+	
+	// ファイル名生成
+	if( uOption & MODE_ROUTE ){
+		// フォルダごと
+		pPath = strchr( strcat( strcpy( g_szBuf, szFile ), "\\" ), '\0' );
+		GetCfgData( pPath, BUF_SIZE, "[maplus_favorite]" );
+		
+		// フォルダ作成
+		StrTokFile( g_szBuf2, g_szBuf, STF_FULL | STF_PATH2 );
+		DebugMsg( "makedir %s\n", g_szBuf2 );
+		MakeSureDirectoryPathExists( g_szBuf2 );
+	}else{
+		// favorite.dat 単体
+		strcpy( g_szBuf, szFile );
+	}
+	
+	DebugMsg( "output %s\n", g_szBuf );
+	
+	// FAVORITE.DAT 書き出し
+	if(( fp = fopen( g_szBuf, "wb" )) == NULL ){
+		printf( "can't open file \"%s\"\n", g_szBuf );
+		return 1;
+	}
+	fwrite( g_pFavoData, sizeof( MAPLUS_DATA ), 1, fp );
+	fclose( fp );
+	
+	// route 書き出し
+	if( uOption & MODE_ROUTE ){
+		
+		GetCfgData( pPath, BUF_SIZE, "[maplus_route]" );
+		
+		for( u = 0; u < g_uRouteCnt; ++u ){
+			// ファイル名生成
+			sprintf( g_szBuf2, g_szBuf, u );
+			
+			// フォルダ作成
+			if( !u ){
+				StrTokFile( g_szFolder, g_szBuf2, STF_FULL | STF_PATH2 );
+				DebugMsg( "makedir %s\n", g_szFolder );
+				MakeSureDirectoryPathExists( g_szFolder );
+			}
+			
+			if(( fp = fopen( g_szBuf2, "wb" )) != NULL ){
+				fwrite( &g_pRouteData[ u ], sizeof( ROUTE_DATA ), 1, fp );
+				fclose( fp );
+				DebugMsg( "output %s\n", g_szBuf2 );
+			}
+		}
+	}
+	
+	return 0;
+}
+
+/*** tab ⇔ csv 変換 ********************************************************/
+
+UCHAR *ConvTab2Csv( UCHAR *szStr ){
+	UCHAR *s = szStr;
+	for(; *s; ++s ) if( *s == '\t' ) *s = ',';
+	return( szStr );
+}
+
+UCHAR *ConvCsv2Tab( UCHAR *szStr ){
+	UCHAR	*s = szStr;
+	UCHAR	*d = szStr;
+	BOOL	bQuote = FALSE;
+	
+	DebugMsg( ">>%s", szStr );
+	
+	do {
+		if( *s == ',' && !bQuote ){
+			// "～" 内でなければ \t に変換
+			*d++ = '\t';
+		}else if( *s == '"' ){
+			if( s[ 1 ] == '"' ){
+				// "" → " 変換
+				*d++ = '"';
+				++s;
+			}else if(
+				bQuote && ( s[ 1 ] == ',' || s[ 1 ] == '\0' ) ||
+				!bQuote && ( s == szStr || s[ -1 ] == ',' )
+			){
+				bQuote = !bQuote;
+			}else{
+				*d++ = *s;
+			}
+		}else{
+			*d++ = *s;
+		}
+	}while( *s++ );
+	
+	DebugMsg( "<<%s", szStr );
+	return( szStr );
+}
+
 /*** icon マッピング ********************************************************/
 
 #define ICON_NONE	0xFFFFFFFF
@@ -652,14 +849,12 @@ enum {
 	XML_PARSE_2ND,
 };
 
-int Kml2Maplus( UCHAR *szSrc, UCHAR *szDst ){
+int Kml2Maplus( UCHAR *szSrc, UCHAR *szDst, UINT uOption ){
 	
 	FILE *fpIn;
-	FILE *fpOut;
 	
 	UINT	uFolder	= 0;
 	
-	UINT	uIcon;
 	UINT	uMode = 0;
 	UINT	uXmlParse = XML_PARSE_1ST;
 	
@@ -670,6 +865,9 @@ int Kml2Maplus( UCHAR *szSrc, UCHAR *szDst ){
 	UCHAR	*p, *pp;
 	UINT	u, uLen;
 	
+	UINT	uRoutesLevel	= 0;
+	UINT	uWPCnt			= 0;
+	
 	cordinate_t	Pos;
 	
 	// spot 数が50 を超えたら，今のフォルダ名を次のフォルダ名にコピーするフラグ
@@ -677,12 +875,10 @@ int Kml2Maplus( UCHAR *szSrc, UCHAR *szDst ){
 	
 	if(( fpIn = fopen( szSrc, "r" )) == NULL ){
 		printf( "can't open file \"%s\"\n", szSrc );
-		return( 1 );
+		return 1;
 	}
 	
-	/*** DAT 初期化 ***/
-	bzero( g_pData, sizeof( MAPLUS_DATA ));
-	strcpy( g_pData->cHeader, "0100" );
+	if( InitMaplusData()) return 1;
 	
 	/*** config リード ***/
 	GetCfgIconTable();
@@ -707,22 +903,39 @@ int Kml2Maplus( UCHAR *szSrc, UCHAR *szDst ){
 		switch( u ){
 		  case KML_NAME:
 			/* フォルダ名 or Spot名 */
-			uLen = MultiByteToWideChar(
-				CP_UTF8,					// UINT		CodePage,		// コードページ
-				0,							// DWORD	dwFlags,		// 文字の種類を指定するフラグ
-				p,							// LPCSTR	lpMultiByteStr,	// マップ元文字列のアドレス
-				strlen( p ),				// int		cchMultiByte,	// マップ元文字列のバイト数
-				( WCHAR *)g_szFolder,		// LPWSTR	lpWideCharStr,	// マップ先ワイド文字列を入れるバッファのアドレス
-				sizeof( g_szFolder )		// int		cchWideChar		// バッファのサイズ
-			);
+			uLen = ConvMulti2Uni( CP_UTF8, p, g_szFolder );
 			(( WCHAR *)g_szFolder )[ uLen ] = 0;
 			
+			DebugCmd(
+				uLen = ConvUni2Multi( CP_ACP, g_szFolder, g_szBuf2 );
+				DebugMsg( "Mode=%d:Lv=%d:%d/%d:Name=%s\n", uMode, uRoutesLevel, uWPCnt, g_uRouteCnt, g_szBuf2 );
+			);
+			
 			if( uMode == MODE_SPOT ){
-				ConvHan2Zen( pSpot->szName, ( WCHAR *)g_szFolder );
+				if( uRoutesLevel ){
+					// WP 名
+					if( uWPCnt < MAX_ROUTE_WP ){
+						ConvHan2Zen( g_pRouteData[ g_uRouteCnt ].WayPoint[ uWPCnt ].szName, ( WCHAR *)g_szFolder );
+					}
+				}else{
+					// スポット名
+					ConvHan2Zen( pSpot->szName, ( WCHAR *)g_szFolder );
+				}
+			}else if( wcscmp(( WCHAR *)g_szFolder, L_ROUTE_ID ) == 0 ){
+				// Routes フォルダ
+				uRoutesLevel = 1;
 			}else{
-				bzero( g_pData->Folder[ uFolder ].szName, sizeof( g_pData->Folder[ uFolder ].szName ));
-				ConvHan2Zen( g_pData->Folder[ uFolder ].szName, ( WCHAR *)g_szFolder );
-				bCopyFolderName = FALSE;
+				// 一般フォルダ
+				if( uRoutesLevel ){
+					// ルート
+					ConvHan2Zen( g_pRouteData[ g_uRouteCnt ].szName, ( WCHAR *)g_szFolder );
+					bCopyFolderName = FALSE;
+					uWPCnt = 0;
+				}else{
+					// スポット
+					ConvHan2Zen( g_pFavoData->Folder[ uFolder ].szName, ( WCHAR *)g_szFolder );
+					bCopyFolderName = FALSE;
+				}
 			}
 			
 		  Case KML_FOLDER:
@@ -736,26 +949,43 @@ int Kml2Maplus( UCHAR *szSrc, UCHAR *szDst ){
 			}
 			
 			uMode = MODE_FOLDER;
+			if( uRoutesLevel ) ++uRoutesLevel;
 			
 		  Case KML_FOLDER2:
 			/* フォルダ脱出 */
-			if(
-				g_pData->Folder[ uFolder ].uNum != 0 &&
+			if( uRoutesLevel ){
+				if( --uRoutesLevel ){
+					// ルートひとつ分を終わる．
+					if( uWPCnt < MAX_ROUTE_WP ){
+						// WP が 5 未満のとき，最後の WP をゴール地点に移動する．
+						
+						g_pRouteData[ g_uRouteCnt ].WayPoint[ MAX_ROUTE_WP - 1 ] =
+							g_pRouteData[ g_uRouteCnt ].WayPoint[ uWPCnt - 1 ];
+						
+						bzero( &g_pRouteData[ g_uRouteCnt ].WayPoint[ uWPCnt - 1 ], sizeof( ROUTE_WP ));
+					}
+					++g_uRouteCnt;
+				}
+			}else if(
+				g_pFavoData->Folder[ uFolder ].uNum != 0 &&
 				++uFolder >= MAX_FOLDER_NUM
 			) goto ExitLoop;
 			
 		  Case KML_PLACEMARK:
-			/* spot */
-			pSpot = &g_pData->Folder[ uFolder ].Spot[ g_pData->Folder[ uFolder ].uNum ];
 			uMode = MODE_SPOT;
 			
-			if( bCopyFolderName ){
-				// strcpy の代わり
-				ConvHan2Zen(
-					g_pData->Folder[ uFolder ].szName,
-					g_pData->Folder[ uFolder - 1 ].szName
-				);
-				bCopyFolderName = FALSE;
+			if( !uRoutesLevel ){
+				/* spot */
+				pSpot = &g_pFavoData->Folder[ uFolder ].Spot[ g_pFavoData->Folder[ uFolder ].uNum ];
+				
+				if( bCopyFolderName ){
+					// strcpy の代わり
+					ConvHan2Zen(
+						g_pFavoData->Folder[ uFolder ].szName,
+						g_pFavoData->Folder[ uFolder - 1 ].szName
+					);
+					bCopyFolderName = FALSE;
+				}
 			}
 			
 		  Case KML_PLACEMARK2:
@@ -765,94 +995,101 @@ int Kml2Maplus( UCHAR *szSrc, UCHAR *szDst ){
 			Pos.lon = dLong;
 			Pos.alt = 0;
 			Molodensky( &Pos, &mTokyo );
-			pSpot->uLati	= ( UINT )( Pos.lat * 0x60000 + .5 );
-			pSpot->uLong	= ( UINT )( Pos.lon * 0x40000 + .5 );
-			/*
-			pSpot->uLati	= ( UINT )(( dLati + 0.00010696  * dLati - 0.000017467 * dLong - 0.0046020 ) * 0x60000 + .5 );
-			pSpot->uLong	= ( UINT )(( dLong + 0.000046047 * dLati + 0.000083049 * dLong - 0.010041  ) * 0x40000 + .5 );
-			*/
 			
-			uMode = MODE_FOLDER;
-			if( ++g_pData->Folder[ uFolder ].uNum >= MAX_SPOT_NUM ){
-				if( ++uFolder >= MAX_FOLDER_NUM ) goto ExitLoop;
-				bCopyFolderName = TRUE;
+			if( uRoutesLevel ){
+				if( uWPCnt < MAX_ROUTE_WP ){
+					g_pRouteData[ g_uRouteCnt ].WayPoint[ uWPCnt ].uLati = ( UINT )( Pos.lat * 0xE1000 + .5 );
+					g_pRouteData[ g_uRouteCnt ].WayPoint[ uWPCnt ].uLong = ( UINT )( Pos.lon * 0xE1000 + .5 );
+					++uWPCnt;
+				}
+			}else{
+				pSpot->uLati	= ( UINT )( Pos.lat * 0x60000 + .5 );
+				pSpot->uLong	= ( UINT )( Pos.lon * 0x40000 + .5 );
+				/*
+				pSpot->uLati	= ( UINT )(( dLati + 0.00010696  * dLati - 0.000017467 * dLong - 0.0046020 ) * 0x60000 + .5 );
+				pSpot->uLong	= ( UINT )(( dLong + 0.000046047 * dLati + 0.000083049 * dLong - 0.010041  ) * 0x40000 + .5 );
+				*/
+				
+				if( ++g_pFavoData->Folder[ uFolder ].uNum >= MAX_SPOT_NUM ){
+					if( ++uFolder >= MAX_FOLDER_NUM ) goto ExitLoop;
+					bCopyFolderName = TRUE;
+				}
 			}
+			uMode = MODE_FOLDER;
 			
 		  Case KML_DESCR:
 			/* コメント */
-			if( pp = strchr( p, 0xD )) *pp = 0;
-			if( pp = strchr( p, 0xA )) *pp = 0;
-			
-			uLen = MultiByteToWideChar(
-				CP_UTF8,					// UINT		CodePage,		// コードページ
-				0,							// DWORD	dwFlags,		// 文字の種類を指定するフラグ
-				p,							// LPCSTR	lpMultiByteStr,	// マップ元文字列のアドレス
-				strlen( p ),				// int		cchMultiByte,	// マップ元文字列のバイト数
-				( WCHAR *)g_szComment,			// LPWSTR	lpWideCharStr,	// マップ先ワイド文字列を入れるバッファのアドレス
-				sizeof( g_szComment )			// int		cchWideChar		// バッファのサイズ
-			);
-			(( WCHAR *)g_szComment )[ uLen ] = 0;
-			
-			ConvHan2Zen( pSpot->szComment, ( WCHAR *)g_szComment );
+			if( !uRoutesLevel ){
+				if( pp = strchr( p, 0xD )) *pp = 0;
+				if( pp = strchr( p, 0xA )) *pp = 0;
+				
+				uLen = ConvMulti2Uni( CP_UTF8, p, g_szComment );
+				(( WCHAR *)g_szComment )[ uLen ] = 0;
+				
+				ConvHan2Zen( pSpot->szComment, ( WCHAR *)g_szComment );
+			}
 			
 		  Case KML_HREF:
 		  case KML_STYLE_URL:
 			/* アイコン URL */
 			
-			// style id の定義なら，style_id->アイコン# を Tbl に登録
-			if( uMode == MODE_STYLE_ID ){
-				if( uXmlParse == XML_PARSE_2ND ){
-					// 2回目のパースなら，見つからなくてもデフォルトを登録
-					AddIcon( GetIconID( p, 0 ), g_pIconPathBufTail );
+			if( !uRoutesLevel ){
+				// style id の定義なら，style_id->アイコン# を Tbl に登録
+				if( uMode == MODE_STYLE_ID ){
+					if( uXmlParse == XML_PARSE_2ND ){
+						// 2回目のパースなら，見つからなくてもデフォルトを登録
+						AddIcon( GetIconID( p, 0 ), g_pIconPathBufTail );
+						
+						DebugMsg( "2ND:%u:%s->%s\n",
+							g_IconTbl[ g_uIconNum - 1 ].uID,
+							g_IconTbl[ g_uIconNum - 1 ].szPath,
+							p
+						);
+						
+					}else if(( u = GetIconID( p, 1 )) != ICON_NONE ){
+						// 1回目でアイコンが見つかった
+						AddIcon( u, g_pIconPathBufTail );
+						
+						DebugMsg( "1ST:%u:%s->%s\n",
+							g_IconTbl[ g_uIconNum - 1 ].uID,
+							g_IconTbl[ g_uIconNum - 1 ].szPath,
+							p
+						);
+						
+					}else{
+						// 1回目でアイコンが見つからなかった -- リパースモードに移行
+						uXmlParse = XML_PARSE_1ST_ERR;
+						
+						DebugMsg( "1ST:none:%s\n", p );
+					}
 					
-					DebugMsg( "2ND:%u:%s->%s\n",
-						g_IconTbl[ g_uIconNum - 1 ].uID,
-						g_IconTbl[ g_uIconNum - 1 ].szPath,
-						p
-					);
-					
-				}else if(( u = GetIconID( p, 1 )) != ICON_NONE ){
-					// 1回目でアイコンが見つかった
-					AddIcon( u, g_pIconPathBufTail );
-					
-					DebugMsg( "1ST:%u:%s->%s\n",
-						g_IconTbl[ g_uIconNum - 1 ].uID,
-						g_IconTbl[ g_uIconNum - 1 ].szPath,
-						p
-					);
-					
-				}else{
-					// 1回目でアイコンが見つからなかった -- リパースモードに移行
-					uXmlParse = XML_PARSE_1ST_ERR;
-					
-					DebugMsg( "1ST:none:%s\n", p );
+					uMode = MODE_NONE;
+					break;
 				}
 				
-				uMode = MODE_NONE;
-				break;
+				/* アイコン */
+				if( uMode == MODE_SPOT ) pSpot->uIcon	= GetIconID( p, 0 );
 			}
-			
-			/* アイコン */
-			if( uMode == MODE_SPOT ) pSpot->uIcon	= GetIconID( p, 0 );
-			
 		  Case KML_STYLE_ID:
 		  case KML_STYLEMAP_ID:
 			/* スタイルID定義 */
-			g_IconTbl[ g_uIconNum ].szPath	= p;
-			
-			strcpy( g_pIconPathBufTail, "#" );
-			strcat( g_pIconPathBufTail + 1, p );
-			if( p = strrchr( g_pIconPathBufTail, '"' )) *p = '\0';
-			
-			uMode = MODE_STYLE_ID;
-			
-		//  Case KML_LONGITUDE:
-		//	/* 東経 */
-		//	dLong = atof( p );
-		//	
-		//  Case KML_LATITUDE:
-		//	/* 北緯 */
-		//	dLati = atof( p );
+			if( !uRoutesLevel ){
+				g_IconTbl[ g_uIconNum ].szPath	= p;
+				
+				strcpy( g_pIconPathBufTail, "#" );
+				strcat( g_pIconPathBufTail + 1, p );
+				if( p = strrchr( g_pIconPathBufTail, '"' )) *p = '\0';
+				
+				uMode = MODE_STYLE_ID;
+				
+			//  Case KML_LONGITUDE:
+			//	/* 東経 */
+			//	dLong = atof( p );
+			//	
+			//  Case KML_LATITUDE:
+			//	/* 北緯 */
+			//	dLati = atof( p );
+			}
 			
 		  Case KML_COORDINATES:
 			dLong = atof( p );
@@ -862,22 +1099,15 @@ int Kml2Maplus( UCHAR *szSrc, UCHAR *szDst ){
 	}
 	
   ExitLoop:
-	// FAVORITE.DAT 書き出し
-	if(( fpOut = fopen( szDst, "wb" )) == NULL ){
-		printf( "can't open file \"%s\"\n", szDst );
-		return( 1 );
-	}
-	fwrite( g_pData, sizeof( MAPLUS_DATA ), 1, fpOut );
-	fclose( fpOut );
+	SaveMaplusData( szDst, uOption );
 	
-	return( 0 );
+	return 0;
 }
 
 /*** maplus → kml **********************************************************/
 
 int Maplus2Kml( UCHAR *szSrc, UCHAR *szDst ){
 	
-	FILE *fpIn;
 	FILE *fpOut;
 	
 	UINT	uFolder;
@@ -888,19 +1118,7 @@ int Maplus2Kml( UCHAR *szSrc, UCHAR *szDst ){
 	
 	cordinate_t Pos;
 	
-	// FAVORITE.DAT リード
-	if(( fpIn = fopen( szSrc, "rb" )) == NULL ){
-		printf( "can't open file \"%s\"\n", szSrc );
-		return( 1 );
-	}
-	
-	fread( g_pData, sizeof( MAPLUS_DATA ), 1, fpIn );
-	fclose( fpIn );
-	
-	if( strcmp( g_pData->cHeader, "0100" ) != 0 ){
-		puts( "not MAPLUS FAVORITE.DAT" );
-		return( 1 );
-	}
+	if( LoadMaplusData( szSrc )) return 1;
 	
 	/*** config リード ***/
 	
@@ -908,7 +1126,7 @@ int Maplus2Kml( UCHAR *szSrc, UCHAR *szDst ){
 		GetCfgAllData( g_szFolderHeader, sizeof( g_szFolderHeader ), "[kml_folder_header]" ) &&
 		GetCfgAllData( g_szFolderFooter, sizeof( g_szFolderFooter ), "[kml_folder_footer]" ) &&
 		GetCfgAllData( g_szSpotBody,	 sizeof( g_szSpotBody ),	 "[kml_spot]" )
-	)) return( 1 );
+	)) return 1;
 	
 	GetCfgIconTable();
 	
@@ -916,12 +1134,12 @@ int Maplus2Kml( UCHAR *szSrc, UCHAR *szDst ){
 	
 	if(( fpOut = fopen( szDst, "wb" )) == NULL ){
 		printf( "can't open file \"%s\"\n", szDst );
-		return( 1 );
+		return 1;
 	}
 	
 	/*** kml ヘッダ出力 ***/
 	
-	if( SearchCfgKey( g_szBuf, BUF_SIZE, "[kml_header]" ) == NULL ) return( 1 );
+	if( SearchCfgKey( g_szBuf, BUF_SIZE, "[kml_header]" ) == NULL ) return 1;
 	
 	while( fgets( g_szBuf, BUF_SIZE, g_fpCfg ) && *g_szBuf != '[' ){
 		fputs( g_szBuf, fpOut );
@@ -931,20 +1149,9 @@ int Maplus2Kml( UCHAR *szSrc, UCHAR *szDst ){
 	
 	for( uFolder = 0; uFolder < MAX_FOLDER_NUM; ++uFolder ){
 		
-		if( g_pData->Folder[ uFolder ].uNum == 0 ) continue;
+		if( g_pFavoData->Folder[ uFolder ].uNum == 0 ) continue;
 		
-		WideCharToMultiByte(
-			CP_UTF8,			// UINT		uCodePage,		// コードページ
-			0,					// DWORD	dwFlags,		// フラグ
-			( LPCWSTR )g_pData->Folder[ uFolder ].szName,
-								// PCWSTR	pWideCharStr,	// 変換元の文字列アドレス
-			sizeof( g_pData->Folder[ uFolder ].szName ) / sizeof( WCHAR ),
-								// int		cchWideChar,	// 文字列の長さ
-			g_szFolder,			// PSTR		pMultiByteStr,	// バッファアドレス
-			BUF_SIZE,			// int		cchMultiByte,	// 文字列の長さ
-			NULL,				// PCSTR	pDefaultChar,	// デフォルトキャラクタ
-			NULL				// PBOOL	pUsedDefaultChar// フラグを格納するアドレス
-		);
+		ConvUni2Multi( CP_UTF8, g_pFavoData->Folder[ uFolder ].szName, g_szFolder );
 		
 		/*** フォルダヘッダ出力 ***/
 		
@@ -952,26 +1159,15 @@ int Maplus2Kml( UCHAR *szSrc, UCHAR *szDst ){
 		
 		/***/
 		
-		for( uSpot = 0; uSpot < g_pData->Folder[ uFolder ].uNum && uSpot < MAX_SPOT_NUM; ++uSpot ){
+		for( uSpot = 0; uSpot < g_pFavoData->Folder[ uFolder ].uNum && uSpot < MAX_SPOT_NUM; ++uSpot ){
 			/*** spot 読み込み ***/
 			
 			// 名前
-			WideCharToMultiByte(
-				CP_UTF8,			// UINT		uCodePage,		// コードページ
-				0,					// DWORD	dwFlags,		// フラグ
-				( LPCWSTR )g_pData->Folder[ uFolder ].Spot[ uSpot ].szName,
-									// PCWSTR	pWideCharStr,	// 変換元の文字列アドレス
-				sizeof( g_pData->Folder[ uFolder ].Spot[ uSpot ].szName ) / sizeof( WCHAR ),
-									// int		cchWideChar,	// 文字列の長さ
-				g_szSpot,			// PSTR		pMultiByteStr,	// バッファアドレス
-				BUF_SIZE,			// int		cchMultiByte,	// 文字列の長さ
-				NULL,				// PCSTR	pDefaultChar,	// デフォルトキャラクタ
-				NULL				// PBOOL	pUsedDefaultChar// フラグを格納するアドレス
-			);
+			ConvUni2Multi( CP_UTF8, g_pFavoData->Folder[ uFolder ].Spot[ uSpot ].szName, g_szSpot );
 			
 			// アイコン, 座標
-			dLati = ( double )g_pData->Folder[ uFolder ].Spot[ uSpot ].uLati / 0x60000;
-			dLong = ( double )g_pData->Folder[ uFolder ].Spot[ uSpot ].uLong / 0x40000;
+			dLati = ( double )g_pFavoData->Folder[ uFolder ].Spot[ uSpot ].uLati / 0x60000;
+			dLong = ( double )g_pFavoData->Folder[ uFolder ].Spot[ uSpot ].uLong / 0x40000;
 			// Tokyo->WGS84 変換
 			
 			// Tokyo で高度 0m になる WGS84 高度を求める
@@ -994,25 +1190,14 @@ int Maplus2Kml( UCHAR *szSrc, UCHAR *szDst ){
 			*/
 			
 			// コメント
-			WideCharToMultiByte(
-				CP_UTF8,			// UINT		uCodePage,		// コードページ
-				0,					// DWORD	dwFlags,		// フラグ
-				( LPCWSTR )&g_pData->Folder[ uFolder ].Spot[ uSpot ].szComment,
-									// PCWSTR	pWideCharStr,	// 変換元の文字列アドレス
-				sizeof( g_pData->Folder[ uFolder ].Spot[ uSpot ].szComment ) / sizeof( WCHAR ),
-									// int		cchWideChar,	// 文字列の長さ
-				g_szComment,		// PSTR		pMultiByteStr,	// バッファアドレス
-				BUF_SIZE,			// int		cchMultiByte,	// 文字列の長さ
-				NULL,				// PCSTR	pDefaultChar,	// デフォルトキャラクタ
-				NULL				// PBOOL	pUsedDefaultChar// フラグを格納するアドレス
-			);
+			ConvUni2Multi( CP_UTF8, g_pFavoData->Folder[ uFolder ].Spot[ uSpot ].szComment, g_szComment );
 			
 			fprintf( fpOut,
 				g_szSpotBody,	// format string
 				g_szSpot,
 				g_szComment,
 				dLong2, dLati2,
-				GetIconPath( g_pData->Folder[ uFolder ].Spot[ uSpot ].uIcon ),
+				GetIconPath( g_pFavoData->Folder[ uFolder ].Spot[ uSpot ].uIcon ),
 				dLong2, dLati2
 			);
 		}
@@ -1022,22 +1207,83 @@ int Maplus2Kml( UCHAR *szSrc, UCHAR *szDst ){
 		fprintf( fpOut, g_szFolderFooter );
 	}
 	
+	/*** ルート出力 *********************************************************/
+	
+	if( g_uRouteCnt ){
+		fprintf( fpOut, g_szFolderHeader, ROUTE_ID );
+		
+		for( uFolder = 0; uFolder < g_uRouteCnt; ++uFolder ){
+			
+			/*** フォルダヘッダ出力 ***/
+			ConvUni2Multi( CP_UTF8, g_pRouteData[ uFolder ].szName, g_szFolder );
+			fprintf( fpOut, g_szFolderHeader, g_szFolder );
+			
+			/***/
+			
+			for( uSpot = 0; uSpot < MAX_ROUTE_WP; ++uSpot ){
+				/*** spot 読み込み ***/
+				
+				if( *g_pRouteData[ uFolder ].WayPoint[ uSpot ].szName == '\0' ) continue;
+				
+				// 名前
+				ConvUni2Multi( CP_UTF8, g_pRouteData[ uFolder ].WayPoint[ uSpot ].szName, g_szSpot );
+				
+				// アイコン, 座標
+				dLati = ( double )g_pRouteData[ uFolder ].WayPoint[ uSpot ].uLati / 0xE1000;
+				dLong = ( double )g_pRouteData[ uFolder ].WayPoint[ uSpot ].uLong / 0xE1000;
+				// Tokyo->WGS84 変換
+				
+				// Tokyo で高度 0m になる WGS84 高度を求める
+				/*
+				Pos.lat = dLati;
+				Pos.lon = dLong;
+				Pos.alt = 0;
+				Molodensky( &Pos, &mTokyo );
+				*/
+				Pos.alt = 0;
+				
+				Pos.lat = dLati;
+				Pos.lon = dLong;
+				Molodensky( &Pos, &mWGS );
+				dLati2 = Pos.lat;
+				dLong2 = Pos.lon;
+				/*
+				dLati2	= dLati - 0.00010695  * dLati + 0.000017464 * dLong + 0.0046017;
+				dLong2	= dLong - 0.000046038 * dLati - 0.000083043 * dLong + 0.010040;
+				*/
+				
+				fprintf( fpOut,
+					g_szSpotBody,	// format string
+					g_szSpot,
+					"",
+					dLong2, dLati2,
+					GetIconPath( 0 ),
+					dLong2, dLati2
+				);
+			}
+			
+			/*** フォルダフッタ出力 ***/
+			
+			fprintf( fpOut, g_szFolderFooter );
+		}
+		fprintf( fpOut, g_szFolderFooter );
+	}
+	
 	/*** kml フッタ出力 ***/
-	if( SearchCfgKey( g_szBuf, BUF_SIZE, "[kml_footer]" ) == NULL ) return( 1 );
+	if( SearchCfgKey( g_szBuf, BUF_SIZE, "[kml_footer]" ) == NULL ) return 1;
 	
 	while( fgets( g_szBuf, BUF_SIZE, g_fpCfg ) && *g_szBuf != '[' ){
 		fputs( g_szBuf, fpOut );
 	}
 	
-	return( 0 );
+	return 0;
 }
 
 /*** txt → maplus **********************************************************/
 
-int Txt2Maplus( UCHAR *szSrc, UCHAR *szDst, UINT uInputMode ){
+int Txt2Maplus( UCHAR *szSrc, UCHAR *szDst, UINT uOption ){
 	
 	FILE *fpIn;
-	FILE *fpOut;
 	
 	UINT	uFolder	= 0;
 	
@@ -1046,6 +1292,8 @@ int Txt2Maplus( UCHAR *szSrc, UCHAR *szDst, UINT uInputMode ){
 	UINT	uLongD, uLongM;
 	double	dLong;
 	UINT	uIcon;
+	BOOL	bRoute = FALSE;
+	UINT	uWPCnt = 0;
 	
 	MAPLUS_SPOT	*pSpot;
 	
@@ -1053,18 +1301,19 @@ int Txt2Maplus( UCHAR *szSrc, UCHAR *szDst, UINT uInputMode ){
 	
 	if(( fpIn = fopen( szSrc, "r" )) == NULL ){
 		printf( "can't open file \"%s\"\n", szSrc );
-		return( 1 );
+		return 1;
 	}
 	
-	/*** DAT 初期化 ***/
-	bzero( g_pData, sizeof( MAPLUS_DATA ));
-	strcpy( g_pData->cHeader, "0100" );
+	if( InitMaplusData()) return 1;
 	
 	while( fgets( g_szBuf, BUF_SIZE, fpIn )){
 		
 		*g_szFolder = *g_szSpot = *g_szComment = '\0';
 		
-		if( uInputMode == MODE_CSV ) ConvCsv2Tab( g_szBuf );
+		if(( uOption & ~MODE_ROUTE ) == MODE_CSV ) ConvCsv2Tab( g_szBuf );
+		
+		if(( p = strchr( g_szBuf, 0xD ))) *p = '\0';
+		if(( p = strchr( g_szBuf, 0xA ))) *p = '\0';
 		
 		sscanf(
 			g_szBuf,
@@ -1082,95 +1331,136 @@ int Txt2Maplus( UCHAR *szSrc, UCHAR *szDst, UINT uInputMode ){
 			g_szComment
 		);
 		
-		if(( p = strchr( g_szComment, 0xD ))) *p = '\0';
-		if(( p = strchr( g_szComment, 0xA ))) *p = '\0';
+		if( strcmp( g_szFolder, ROUTE_ID ) == 0 ){
+			*g_szPrevFolder = '\0';
+			bRoute = TRUE;
+			continue;
+		}
 		
-		// フォルダ名が違う，または spot が MAX_SPOT_NUM に達したら
-		// 次の folder へ
-		
-		if(
-			strcmp( g_szFolder, g_szPrevFolder ) != 0 && g_pData->Folder[ uFolder ].uNum != 0 ||
-			g_pData->Folder[ uFolder ].uNum == MAX_SPOT_NUM
-		){
-			if( ++uFolder >= MAX_FOLDER_NUM ){
-				printf( "folder num > %d\n", MAX_FOLDER_NUM );
-				break;
+		if( bRoute ){
+			// フォルダ名が違うなら次の folder へ
+			if( *g_szPrevFolder && strcmp( g_szFolder, g_szPrevFolder ) != 0 ){
+				
+				// ルートひとつ分を終わる．
+				if( uWPCnt < MAX_ROUTE_WP ){
+					// WP が 5 未満のとき，最後の WP をゴール地点に移動する．
+					
+					g_pRouteData[ g_uRouteCnt ].WayPoint[ MAX_ROUTE_WP - 1 ] =
+						g_pRouteData[ g_uRouteCnt ].WayPoint[ uWPCnt - 1 ];
+					
+					bzero( &g_pRouteData[ g_uRouteCnt ].WayPoint[ uWPCnt - 1 ], sizeof( ROUTE_WP ));
+				}
+				
+				uWPCnt = 0;
+				if( ++g_uRouteCnt >= MAX_ROUTE ){
+					printf( "folder num > %d\n", MAX_ROUTE );
+					break;
+				}
 			}
-		}
-		
-		if( g_pData->Folder[ uFolder ].uNum == 0 ){
-			MultiByteToWideChar(
-				CP_ACP,						// UINT		CodePage,		// コードページ
-				0,							// DWORD	dwFlags,		// 文字の種類を指定するフラグ
-				g_szFolder,					// LPCSTR	lpMultiByteStr,	// マップ元文字列のアドレス
-				strlen( g_szFolder ),		// int		cchMultiByte,	// マップ元文字列のバイト数
-				( WCHAR *)g_pData->Folder[ uFolder ].szName,	// LPWSTR	lpWideCharStr,	// マップ先ワイド文字列を入れるバッファのアドレス
-				sizeof( g_pData->Folder[ uFolder ].szName )		// int		cchWideChar		// バッファのサイズ
-			);
 			
-			ConvHan2Zen( g_pData->Folder[ uFolder ].szName, g_pData->Folder[ uFolder ].szName );
+			// ルート名をセット
+			if( !*g_pRouteData[ g_uRouteCnt ].szName ){
+				ConvMulti2Uni( CP_ACP, g_szFolder, g_pRouteData[ g_uRouteCnt ].szName );
+				ConvHan2Zen( g_pRouteData[ g_uRouteCnt ].szName, g_pRouteData[ g_uRouteCnt ].szName );
+				strcpy( g_szPrevFolder, g_szFolder );
+			}
 			
-			strcpy( g_szPrevFolder, g_szFolder );
+			/*** Spot 出力 ***/
+			
+			if( uWPCnt < MAX_ROUTE_WP ){
+				#define WAY_POINT	g_pRouteData[ g_uRouteCnt ].WayPoint[ uWPCnt ]
+				
+				ConvMulti2Uni( CP_ACP, g_szSpot,	WAY_POINT.szName );
+				ConvHan2Zen( WAY_POINT.szName,		WAY_POINT.szName );
+				
+				// 緯度・経度
+				if( sscanf( g_szLati, "%d%*[^0-9]%d%*[^0-9]%lf", &uLatiD, &uLatiM, &dLati ) < 3 ){
+					uLatiD = uLatiM = 0;
+					dLati = atof( g_szLati ) * 3600;
+				}
+				if( sscanf( g_szLong, "%d%*[^0-9]%d%*[^0-9]%lf", &uLongD, &uLongM, &dLong ) < 3 ){
+					uLongD = uLongM = 0;
+					dLong = atof( g_szLong ) * 3600;
+				}
+				
+				WAY_POINT.uLati	= ( UINT )(( double )( uLatiD * 3600 + uLatiM * 60 + dLati ) * 0xE1000 / 3600 + .5 );
+				WAY_POINT.uLong	= ( UINT )(( double )( uLongD * 3600 + uLongM * 60 + dLong ) * 0xE1000 / 3600 + .5 );
+				
+				++uWPCnt;
+			}
+		}else{
+			// フォルダ名が違う，または spot が MAX_SPOT_NUM に達したら
+			// 次の folder へ
+			
+			if(
+				strcmp( g_szFolder, g_szPrevFolder ) != 0 && g_pFavoData->Folder[ uFolder ].uNum != 0 ||
+				g_pFavoData->Folder[ uFolder ].uNum == MAX_SPOT_NUM
+			){
+				if( ++uFolder >= MAX_FOLDER_NUM ){
+					printf( "folder num > %d\n", MAX_FOLDER_NUM );
+					break;
+				}
+			}
+			
+			if( g_pFavoData->Folder[ uFolder ].uNum == 0 ){
+				ConvMulti2Uni( CP_ACP, g_szFolder, g_pFavoData->Folder[ uFolder ].szName );
+				
+				ConvHan2Zen( g_pFavoData->Folder[ uFolder ].szName, g_pFavoData->Folder[ uFolder ].szName );
+				
+				strcpy( g_szPrevFolder, g_szFolder );
+			}
+			
+			/*** Spot 出力 ***/
+			
+			pSpot = &g_pFavoData->Folder[ uFolder ].Spot[ g_pFavoData->Folder[ uFolder ].uNum ];
+			
+			ConvMulti2Uni( CP_ACP, g_szSpot, pSpot->szName );
+			ConvMulti2Uni( CP_ACP, g_szComment, pSpot->szComment );
+			
+			ConvHan2Zen( pSpot->szName,    pSpot->szName );
+			ConvHan2Zen( pSpot->szComment, pSpot->szComment );
+			
+			// 緯度・経度
+			if( sscanf( g_szLati, "%d%*[^0-9]%d%*[^0-9]%lf", &uLatiD, &uLatiM, &dLati ) < 3 ){
+				uLatiD = uLatiM = 0;
+				dLati = atof( g_szLati ) * 3600;
+			}
+			if( sscanf( g_szLong, "%d%*[^0-9]%d%*[^0-9]%lf", &uLongD, &uLongM, &dLong ) < 3 ){
+				uLongD = uLongM = 0;
+				dLong = atof( g_szLong ) * 3600;
+			}
+			
+			pSpot->uIcon	= uIcon;
+			pSpot->uLati	= ( UINT )(( double )( uLatiD * 3600 + uLatiM * 60 + dLati ) * 0x60000 / 3600 + .5 );
+			pSpot->uLong	= ( UINT )(( double )( uLongD * 3600 + uLongM * 60 + dLong ) * 0x40000 / 3600 + .5 );
+			
+			++g_pFavoData->Folder[ uFolder ].uNum;
 		}
-		
-		/*** Spot 出力 ***/
-		
-		pSpot = &g_pData->Folder[ uFolder ].Spot[ g_pData->Folder[ uFolder ].uNum ];
-		
-		MultiByteToWideChar(
-			CP_ACP,						// UINT		CodePage,		// コードページ
-			0,							// DWORD	dwFlags,		// 文字の種類を指定するフラグ
-			g_szSpot,					// LPCSTR	lpMultiByteStr,	// マップ元文字列のアドレス
-			strlen( g_szSpot ),			// int		cchMultiByte,	// マップ元文字列のバイト数
-			( WCHAR *)pSpot->szName,	// LPWSTR	lpWideCharStr,	// マップ先ワイド文字列を入れるバッファのアドレス
-			sizeof( pSpot->szName )		// int		cchWideChar		// バッファのサイズ
-		);
-		
-		MultiByteToWideChar(
-			CP_ACP,						// UINT		CodePage,		// コードページ
-			0,							// DWORD	dwFlags,		// 文字の種類を指定するフラグ
-			g_szComment,				// LPCSTR	lpMultiByteStr,	// マップ元文字列のアドレス
-			strlen( g_szComment ),		// int		cchMultiByte,	// マップ元文字列のバイト数
-			( WCHAR *)pSpot->szComment,// LPWSTR	lpWideCharStr,	// マップ先ワイド文字列を入れるバッファのアドレス
-			sizeof( pSpot->szComment )// int		cchWideChar		// バッファのサイズ
-		);
-		
-		ConvHan2Zen( pSpot->szName,    pSpot->szName );
-		ConvHan2Zen( pSpot->szComment, pSpot->szComment );
-		
-		// 緯度・経度
-		if( sscanf( g_szLati, "%d%*[^0-9]%d%*[^0-9]%lf", &uLatiD, &uLatiM, &dLati ) < 3 ){
-			uLatiD = uLatiM = 0;
-			dLati = atof( g_szLati ) * 3600;
+	}
+	
+	if( bRoute && uWPCnt ){
+		// ルートひとつ分を終わる．
+		if( uWPCnt < MAX_ROUTE_WP ){
+			// WP が 5 未満のとき，最後の WP をゴール地点に移動する．
+			
+			g_pRouteData[ g_uRouteCnt ].WayPoint[ MAX_ROUTE_WP - 1 ] =
+				g_pRouteData[ g_uRouteCnt ].WayPoint[ uWPCnt - 1 ];
+			
+			bzero( &g_pRouteData[ g_uRouteCnt ].WayPoint[ uWPCnt - 1 ], sizeof( ROUTE_WP ));
 		}
-		if( sscanf( g_szLong, "%d%*[^0-9]%d%*[^0-9]%lf", &uLongD, &uLongM, &dLong ) < 3 ){
-			uLongD = uLongM = 0;
-			dLong = atof( g_szLong ) * 3600;
-		}
-		
-		pSpot->uIcon	= uIcon;
-		pSpot->uLati	= ( UINT )(( double )( uLatiD * 3600 + uLatiM * 60 + dLati ) * 0x60000 / 3600 + .5 );
-		pSpot->uLong	= ( UINT )(( double )( uLongD * 3600 + uLongM * 60 + dLong ) * 0x40000 / 3600 + .5 );
-		
-		++g_pData->Folder[ uFolder ].uNum;
+		++g_uRouteCnt;
 	}
 	
 	// FAVORITE.DAT 書き出し
-	if(( fpOut = fopen( szDst, "wb" )) == NULL ){
-		printf( "can't open file \"%s\"\n", szDst );
-		return( 1 );
-	}
-	fwrite( g_pData, sizeof( MAPLUS_DATA ), 1, fpOut );
-	fclose( fpOut );
+	SaveMaplusData( szDst, uOption );
 	
-	return( 0 );
+	return 0;
 }
 
 /*** maplus → txt **********************************************************/
 
 int Maplus2Txt( UCHAR *szSrc, UCHAR *szDst, UINT uOutputMode ){
 	
-	FILE *fpIn;
 	FILE *fpOut;
 	
 	UINT	uFolder;
@@ -1179,71 +1469,36 @@ int Maplus2Txt( UCHAR *szSrc, UCHAR *szDst, UINT uOutputMode ){
 	double	dLati, dLong;
 	UCHAR	*p;
 	
-	// FAVORITE.DAT リード
-	if(( fpIn = fopen( szSrc, "rb" )) == NULL ){
-		printf( "can't open file \"%s\"\n", szSrc );
-		return( 1 );
-	}
-	
-	fread( g_pData, sizeof( MAPLUS_DATA ), 1, fpIn );
-	fclose( fpIn );
-	
-	if( strcmp( g_pData->cHeader, "0100" ) != 0 ){
-		puts( "not MAPLUS FAVORITE.DAT" );
-		return( 1 );
-	}
-	
-	if( GetCfgData( g_szDegFormat, sizeof( g_szDegFormat ), "[degree_format]" ) == NULL ) return( 1 );
+	if( LoadMaplusData( szSrc )) return 1;
+	if( GetCfgData( g_szDegFormat, sizeof( g_szDegFormat ), "[degree_format]" ) == NULL ) return 1;
 	
 	/***/
 	
 	if(( fpOut = fopen( szDst, "w" )) == NULL ){
 		printf( "can't open file \"%s\"\n", szDst );
-		return( 1 );
+		return 1;
 	}
 	
 	/*** header 読み飛ばし ***/
 	
 	for( uFolder = 0; uFolder < MAX_FOLDER_NUM; ++uFolder ){
 		
-		WideCharToMultiByte(
-			CP_ACP,				// UINT		uCodePage,		// コードページ
-			0,					// DWORD	dwFlags,		// フラグ
-			( LPCWSTR )g_pData->Folder[ uFolder ].szName,
-								// PCWSTR	pWideCharStr,	// 変換元の文字列アドレス
-			sizeof( g_pData->Folder[ uFolder ].szName ) / sizeof( WCHAR ),
-								// int		cchWideChar,	// 文字列の長さ
-			g_szFolder,			// PSTR		pMultiByteStr,	// バッファアドレス
-			BUF_SIZE,			// int		cchMultiByte,	// 文字列の長さ
-			NULL,				// PCSTR	pDefaultChar,	// デフォルトキャラクタ
-			NULL				// PBOOL	pUsedDefaultChar// フラグを格納するアドレス
-		);
+		ConvUni2Multi( CP_ACP, g_pFavoData->Folder[ uFolder ].szName, g_szFolder );
 		
-		for( uSpot = 0; uSpot < g_pData->Folder[ uFolder ].uNum && uSpot < MAX_SPOT_NUM; ++uSpot ){
+		for( uSpot = 0; uSpot < g_pFavoData->Folder[ uFolder ].uNum && uSpot < MAX_SPOT_NUM; ++uSpot ){
 			p = g_szBuf2;
 			
 			/*** spot 読み込み ***/
 			
 			// 名前
-			WideCharToMultiByte(
-				CP_ACP,				// UINT		uCodePage,		// コードページ
-				0,					// DWORD	dwFlags,		// フラグ
-				( LPCWSTR )g_pData->Folder[ uFolder ].Spot[ uSpot ].szName,
-									// PCWSTR	pWideCharStr,	// 変換元の文字列アドレス
-				sizeof( g_pData->Folder[ uFolder ].Spot[ uSpot ].szName ) / sizeof( WCHAR ),
-									// int		cchWideChar,	// 文字列の長さ
-				g_szBuf,			// PSTR		pMultiByteStr,	// バッファアドレス
-				BUF_SIZE,			// int		cchMultiByte,	// 文字列の長さ
-				NULL,				// PCSTR	pDefaultChar,	// デフォルトキャラクタ
-				NULL				// PBOOL	pUsedDefaultChar// フラグを格納するアドレス
-			);
+			ConvUni2Multi( CP_ACP, g_pFavoData->Folder[ uFolder ].Spot[ uSpot ].szName, g_szBuf );
 			
 			sprintf( p, "%s\t%s\t", g_szFolder, g_szBuf );
 			p = strchr( p, '\0' );
 			
 			// アイコン, 座標
-			dLati = ( double )g_pData->Folder[ uFolder ].Spot[ uSpot ].uLati * 3600 / 0x60000;
-			dLong = ( double )g_pData->Folder[ uFolder ].Spot[ uSpot ].uLong * 3600 / 0x40000;
+			dLati = ( double )g_pFavoData->Folder[ uFolder ].Spot[ uSpot ].uLati * 3600 / 0x60000;
+			dLong = ( double )g_pFavoData->Folder[ uFolder ].Spot[ uSpot ].uLong * 3600 / 0x40000;
 			
 			sprintf(
 				g_szLati, g_szDegFormat,
@@ -1262,24 +1517,13 @@ int Maplus2Txt( UCHAR *szSrc, UCHAR *szDst, UINT uOutputMode ){
 			sprintf(
 				p,
 				"%d\t%s\t%s\t",
-				g_pData->Folder[ uFolder ].Spot[ uSpot ].uIcon,
+				g_pFavoData->Folder[ uFolder ].Spot[ uSpot ].uIcon,
 				g_szLati, g_szLong
 			);
 			p = strchr( p, '\0' );
 			
 			// コメント
-			WideCharToMultiByte(
-				CP_ACP,				// UINT		uCodePage,		// コードページ
-				0,					// DWORD	dwFlags,		// フラグ
-				( LPCWSTR )&g_pData->Folder[ uFolder ].Spot[ uSpot ].szComment,
-									// PCWSTR	pWideCharStr,	// 変換元の文字列アドレス
-				sizeof( g_pData->Folder[ uFolder ].Spot[ uSpot ].szComment ) / sizeof( WCHAR ),
-									// int		cchWideChar,	// 文字列の長さ
-				g_szBuf,			// PSTR		pMultiByteStr,	// バッファアドレス
-				BUF_SIZE,			// int		cchMultiByte,	// 文字列の長さ
-				NULL,				// PCSTR	pDefaultChar,	// デフォルトキャラクタ
-				NULL				// PBOOL	pUsedDefaultChar// フラグを格納するアドレス
-			);
+			ConvUni2Multi( CP_ACP, g_pFavoData->Folder[ uFolder ].Spot[ uSpot ].szComment, g_szBuf );
 			
 			sprintf( p, "%s\n", g_szBuf );
 			p = strchr( p, '\0' );
@@ -1292,7 +1536,62 @@ int Maplus2Txt( UCHAR *szSrc, UCHAR *szDst, UINT uOutputMode ){
 		}
 	}
 	
-	return( 0 );
+	if( g_uRouteCnt ){
+		fputs( ROUTE_ID "\n", fpOut );
+		
+		for( uFolder = 0; uFolder < g_uRouteCnt; ++uFolder ){
+			
+			ConvUni2Multi( CP_ACP, g_pRouteData[ uFolder ].szName, g_szFolder );
+			
+			for( uSpot = 0; uSpot < MAX_ROUTE_WP; ++uSpot ){
+				
+				if( *g_pRouteData[ uFolder ].WayPoint[ uSpot ].szName == '\0' ) continue;
+				p = g_szBuf2;
+				
+				/*** spot 読み込み ***/
+				
+				// 名前
+				ConvUni2Multi( CP_ACP, g_pRouteData[ uFolder ].WayPoint[ uSpot ].szName, g_szBuf );
+				
+				sprintf( p, "%s\t%s\t", g_szFolder, g_szBuf );
+				p = strchr( p, '\0' );
+				
+				// アイコン, 座標
+				dLati = ( double )g_pRouteData[ uFolder ].WayPoint[ uSpot ].uLati * 3600 / 0xE1000;
+				dLong = ( double )g_pRouteData[ uFolder ].WayPoint[ uSpot ].uLong * 3600 / 0xE1000;
+				
+				sprintf(
+					g_szLati, g_szDegFormat,
+					( UINT )dLati / 3600,
+					( UINT )dLati % 3600 / 60,
+					dLati - ( UINT )( dLati / 60 ) * 60
+				);
+				
+				sprintf(
+					g_szLong, g_szDegFormat,
+					( UINT )dLong / 3600,
+					( UINT )dLong % 3600 / 60,
+					dLong - ( UINT )( dLong / 60 ) * 60
+				);
+				
+				sprintf(
+					p,
+					"0\t%s\t%s\t\n",
+					g_szLati, g_szLong
+				);
+				p = strchr( p, '\0' );
+				
+				if( uOutputMode == MODE_CSV ){
+					fputs( ConvTab2Csv( g_szBuf2 ), fpOut );
+				}else{
+					fputs( g_szBuf2, fpOut );
+				}
+			}
+		}
+	}
+	
+	fclose( fpOut );
+	return 0;
 }
 
 /*** main *******************************************************************/
@@ -1300,8 +1599,8 @@ int Maplus2Txt( UCHAR *szSrc, UCHAR *szDst, UINT uOutputMode ){
 int main( int argc, UCHAR **argv ){
 	
 	static UCHAR szDst[ MAX_PATH ];
-	UINT	uOutputMode = MODE_TXT;
-	UCHAR	*p;
+	UINT	uOutputMode		= MODE_TXT;
+	UINT	uOutputDatMode	= 0;
 	
 	*g_szPrevFolder = '\0';
 	
@@ -1309,14 +1608,14 @@ int main( int argc, UCHAR **argv ){
 	
 	if( argc <= 1 ){
 		printf( "usage: %s <src_file> [<dst_file>]\n", szDst );
-		return( 0 );
+		return 0;
 	}
 	
 	/*** config ファイルリード **********************************************/
 	
 	if(( g_fpCfg = fopen( ChangeExt( szDst, argv[ 0 ], "cfg" ), "r" )) == NULL ){
 		printf( "can't open file \"%s\"\n", szDst );
-		return( 1 );
+		return 1;
 	}
 	
 	// default output
@@ -1325,24 +1624,35 @@ int main( int argc, UCHAR **argv ){
 						stricmp( g_szBuf, "csv" ) == 0 ? MODE_CSV : MODE_TXT;
 	}
 	
-	DebugMsg( "output:%s\n", g_szBuf );
+	// default output
+	if( GetCfgData( g_szBuf, BUF_SIZE, "[output_dat]" ) && stricmp( g_szBuf, "dat" )){
+		uOutputDatMode = MODE_ROUTE;
+	}
+	
+	DebugMsg( "output:%X:%s\n", uOutputDatMode | uOutputMode, g_szBuf );
 	
 	/************************************************************************/
 	
 	if(
-		( g_pData = malloc( sizeof( MAPLUS_DATA ))) == NULL ||
 		( g_pIconPathBufTail = g_pIconPathBuf = malloc( BUF_SIZE_ICON_PATH )) == NULL
 	){
 		puts( "not enough memony" );
 	}
 	
+	#define DST_FILE( ext )	( argc >= 3 ? argv[ 2 ] : ChangeExt( szDst, argv[ 1 ], ext ))
+	
 	return
-		IsExt( argv[ 1 ], "dat" ) ? (
-			uOutputMode == MODE_KML ? Maplus2Kml( argv[ 1 ], argc >= 3 ? argv[ 2 ] : ChangeExt( szDst, argv[ 1 ], "kml" )) :
-			uOutputMode == MODE_CSV ? Maplus2Txt( argv[ 1 ], argc >= 3 ? argv[ 2 ] : ChangeExt( szDst, argv[ 1 ], "csv" ), uOutputMode ) :
-									  Maplus2Txt( argv[ 1 ], argc >= 3 ? argv[ 2 ] : ChangeExt( szDst, argv[ 1 ], "txt" ), uOutputMode )
-		) :
-		IsExt( argv[ 1 ], "kml" ) ? Kml2Maplus( argv[ 1 ], argc >= 3 ? argv[ 2 ] : ChangeExt( szDst, argv[ 1 ], "dat" )) :
-		IsExt( argv[ 1 ], "csv" ) ? Txt2Maplus( argv[ 1 ], argc >= 3 ? argv[ 2 ] : ChangeExt( szDst, argv[ 1 ], "dat" ), MODE_CSV ) :
-									Txt2Maplus( argv[ 1 ], argc >= 3 ? argv[ 2 ] : ChangeExt( szDst, argv[ 1 ], "dat" ), MODE_TXT );
+		( IsExt( argv[ 1 ], "dat" ) || IsExt( argv[ 1 ], NULL )) ? (
+			uOutputMode == MODE_KML ? Maplus2Kml( argv[ 1 ], DST_FILE( "kml" )) :
+			uOutputMode == MODE_CSV ? Maplus2Txt( argv[ 1 ], DST_FILE( "csv" ), uOutputMode ) :
+									  Maplus2Txt( argv[ 1 ], DST_FILE( "txt" ), uOutputMode )
+		) : ( uOutputDatMode == MODE_ROUTE ) ? (
+			IsExt( argv[ 1 ], "kml" )	? Kml2Maplus( argv[ 1 ], DST_FILE( NULL ), MODE_ROUTE ) :
+			IsExt( argv[ 1 ], "csv" )	? Txt2Maplus( argv[ 1 ], DST_FILE( NULL ), MODE_ROUTE | MODE_CSV ) :
+										  Txt2Maplus( argv[ 1 ], DST_FILE( NULL ), MODE_ROUTE | MODE_TXT )
+		) : (
+			IsExt( argv[ 1 ], "kml" )	? Kml2Maplus( argv[ 1 ], DST_FILE( "dat" ), 0 ) :
+			IsExt( argv[ 1 ], "csv" )	? Txt2Maplus( argv[ 1 ], DST_FILE( "dat" ), MODE_CSV ) :
+										  Txt2Maplus( argv[ 1 ], DST_FILE( "dat" ), MODE_TXT )
+		);
 }
