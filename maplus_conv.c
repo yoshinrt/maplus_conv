@@ -19,7 +19,7 @@
 #define MAX_FOLDER_NUM	50
 #define MAX_SPOT_NUM	50
 
-#define MAX_ROUTE		200
+#define MAX_ROUTE		500
 #define MAX_ROUTE_WP	5
 
 #define ROUTE_ID		"Routes"
@@ -675,19 +675,32 @@ int LoadMaplusData( UCHAR *szFile ){
 	}
 	
 	if( pPath ){
-		// route をロード
+		HANDLE			hFind;
+		WIN32_FIND_DATA	FindData;
 		
+		/*** route をロード ***/
+		
+		// SAVEDATA\ULJS00128ROUTE\*.DAT を生成
 		GetCfgData( pPath, BUF_SIZE, "[maplus_route]" );
+		StrTokFile( g_szBuf2, g_szBuf, STF_PATH2 );
+		strcpy( g_szBuf, g_szBuf2 );
+		strcat( g_szBuf2, "*.DAT" );
 		
-		for( u = 0; u < MAX_ROUTE; ++u ){
-			sprintf( g_szBuf2, g_szBuf, u );
+		if(( hFind = FindFirstFile( g_szBuf2, &FindData )) != INVALID_HANDLE_VALUE ){
+			do{
+				// ファイル名生成
+				strcat( strcpy( g_szBuf2, g_szBuf ), FindData.cFileName );
+				
+				// ファイルオープン
+				if(( fp = fopen( g_szBuf2, "rb" )) != NULL ){
+					DebugMsg( "loading %s\n", g_szBuf2 );
+					fread( &g_pRouteData[ g_uRouteCnt ], sizeof( ROUTE_DATA ), 1, fp );
+					fclose( fp );
+					if( ++g_uRouteCnt >= MAX_ROUTE ) break;
+				}
+			}while( FindNextFile( hFind, &FindData ));
 			
-			if(( fp = fopen( g_szBuf2, "rb" )) != NULL ){
-				DebugMsg( "loading %s\n", g_szBuf2 );
-				fread( &g_pRouteData[ g_uRouteCnt ], sizeof( ROUTE_DATA ), 1, fp );
-				++g_uRouteCnt;
-				fclose( fp );
-			}
+			FindClose( hFind );
 		}
 	}
 	return 0;
@@ -924,15 +937,15 @@ int Kml2Maplus( UCHAR *szSrc, UCHAR *szDst, UINT uOption ){
 			}else if( wcscmp(( WCHAR *)g_szFolder, L_ROUTE_ID ) == 0 ){
 				// Routes フォルダ
 				uRoutesLevel = 1;
-			}else{
-				// 一般フォルダ
+			}else{	// 一般フォルダ
 				if( uRoutesLevel ){
 					// ルート
 					ConvHan2Zen( g_pRouteData[ g_uRouteCnt ].szName, ( WCHAR *)g_szFolder );
 					bCopyFolderName = FALSE;
 					uWPCnt = 0;
 				}else{
-					// スポット
+					// favorite.dat
+					bzero( g_pFavoData->Folder[ uFolder ].szName, sizeof( g_pFavoData->Folder[ uFolder ].szName ));
 					ConvHan2Zen( g_pFavoData->Folder[ uFolder ].szName, ( WCHAR *)g_szFolder );
 					bCopyFolderName = FALSE;
 				}
