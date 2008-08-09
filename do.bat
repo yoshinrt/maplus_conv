@@ -2,7 +2,8 @@
 
 : $Id$
 
-call "C:\Program Files\Microsoft Visual Studio\VC98\Bin\VCVARS32.BAT"
+call "%VS90COMNTOOLS%vsvars32.bat"
+
 cl imagehlp.lib /O2 /MD /nologo %1 /link /NOLOGO
 
 : cd /d G:\DDS\maplus_conv\maplus_conv
