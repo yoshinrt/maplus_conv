@@ -10,6 +10,7 @@
 *****************************************************************************/
 
 //#define DEBUG
+//#define MAPLUS3
 
 #include <stdio.h>
 #include <string.h>
@@ -28,8 +29,15 @@
 #define MAX_FOLDER_NUM	50
 #define MAX_SPOT_NUM	50
 
-#define MAX_ROUTE		500
-#define MAX_ROUTE_WP	5
+#define MAX_ROUTE		99
+
+#ifdef MAPLUS3
+	#define MAX_ROUTE_WP	7	// MAPLUS3 のルートデータの WP 数
+	#define ROUTE_HEADER_ID	"4100"
+#else
+	#define MAX_ROUTE_WP	5	// MAPLUS2 のルートデータの WP 数
+	#define ROUTE_HEADER_ID	"2100"
+#endif
 
 #define ROUTE_ID		"Routes"
 #define L_ROUTE_ID		L"Routes"
@@ -102,19 +110,37 @@ typedef struct {
 	MAPLUS_FOLDER	Folder[ MAX_FOLDER_NUM ];
 } MAPLUS_DATA;
 
-// MAPLUS route data
-
-typedef struct {
-	WCHAR	szName[ 200 / 2 ];
-	UINT	uLati;
-	UINT	uLong;
-} ROUTE_WP;
-
-typedef struct {
-	UCHAR		cHeader[ 20 ];
-	WCHAR		szName[ 200 / 2 ];
-	ROUTE_WP	WayPoint[ MAX_ROUTE_WP ];
-} ROUTE_DATA;
+#ifdef MAPLUS3
+	// MAPLUS3 route data
+	typedef struct {
+		WCHAR	szName[ 114 / 2 ];
+		UCHAR	cPadding[ 86 ];
+		UINT	uLati;
+		UINT	uLong;
+		UINT	uValid;
+	} ROUTE_WP;
+	
+	typedef struct {
+		UCHAR		cHeader[ 20 ];
+		WCHAR		szName[ 114 / 2 ];
+		UCHAR		cPadding[ 86 ];
+		ROUTE_WP	WayPoint[ MAX_ROUTE_WP ];
+	} ROUTE_DATA;
+#else
+	// MAPLUS2 route data
+	typedef struct {
+		WCHAR	szName[ 200 / 2 ];
+		UINT	uLati;
+		UINT	uLong;
+	} ROUTE_WP;
+	
+	typedef struct {
+		UCHAR		cHeader[ 20 ];
+		WCHAR		szName[ 200 / 2 ];
+		ROUTE_WP	WayPoint[ MAX_ROUTE_WP ];
+	} ROUTE_DATA;
+	
+#endif
 
 // misc
 typedef struct {
@@ -638,7 +664,7 @@ int InitMaplusData( void ){
 	strcpy( g_pFavoData->cHeader, "0100" );
 	
 	bzero( g_pRouteData, sizeof( ROUTE_DATA ) * MAX_ROUTE );
-	for( u = 0; u < MAX_ROUTE; ++u ) strcpy( g_pRouteData[ u ].cHeader, "2100" );
+	for( u = 0; u < MAX_ROUTE; ++u ) strcpy( g_pRouteData[ u ].cHeader, ROUTE_HEADER_ID );
 	
 	return 0;
 }
@@ -1022,6 +1048,10 @@ int Kml2Maplus( UCHAR *szSrc, UCHAR *szDst, UINT uOption ){
 				if( uWPCnt < MAX_ROUTE_WP ){
 					g_pRouteData[ g_uRouteCnt ].WayPoint[ uWPCnt ].uLati = ( UINT )( Pos.lat * 0xE1000 + .5 );
 					g_pRouteData[ g_uRouteCnt ].WayPoint[ uWPCnt ].uLong = ( UINT )( Pos.lon * 0xE1000 + .5 );
+					
+					#ifdef MAPLUS3
+						g_pRouteData[ g_uRouteCnt ].WayPoint[ uWPCnt ].uValid = 1;
+					#endif
 					++uWPCnt;
 				}
 			}else{
@@ -1408,6 +1438,9 @@ int Txt2Maplus( UCHAR *szSrc, UCHAR *szDst, UINT uOption ){
 				WAY_POINT.uLati	= ( UINT )(( double )( uLatiD * 3600 + uLatiM * 60 + dLati ) * 0xE1000 / 3600 + .5 );
 				WAY_POINT.uLong	= ( UINT )(( double )( uLongD * 3600 + uLongM * 60 + dLong ) * 0xE1000 / 3600 + .5 );
 				
+				#ifdef MAPLUS3
+					g_pRouteData[ g_uRouteCnt ].WayPoint[ uWPCnt ].uValid = 1;
+				#endif
 				++uWPCnt;
 			}
 		}else{
